@@ -44,7 +44,8 @@ $Global:SearchContext = $null
 # STATIC CONFIG (INTERNAL TOOL)
 # ===============================
 
-$TenantDomain = "yourdomain.com"
+$TenantDomain  = "yourdomain.com"
+$RecipientsCSV = "$env:USERPROFILE\OneDrive - YourOrg\MCP Internal Automations - mail-investigation-tool\recipients.csv"
 
 # ===============================
 # UI HELPERS
@@ -113,26 +114,148 @@ function Load-ExistingSearch {
 # ===============================
 # DISCOVERY
 # ===============================
-
 function Invoke-MailDiscovery {
 
     Show-Header "DISCOVERY"
 
-    $type = (Read-Host "  MAIL or MEETING").ToUpper()
-    if ($type -notin @("MAIL","MEETING")) { return }
+    # ---------------------------
+    # Mail or Meeting (menu)
+    # ---------------------------
+    Write-Host "  1 - Mail"
+    Write-Host "  2 - Meeting"
+    Write-Host ""
+
+    switch (Read-Host "  Select type") {
+        "1" { $type = "MAIL" }
+        "2" { $type = "MEETING" }
+        default {
+            Write-Host "  Invalid option." -ForegroundColor Yellow
+            Start-Sleep 2
+            return
+        }
+    }
+
+    Write-Host ""
 
     # ---------------------------
     # Target mailboxes
     # ---------------------------
-    $mailboxes = (Read-Host "  Target mailboxes (comma-separated)") `
-        -split ";" |
-        ForEach-Object { $_.Trim() } |
-        Where-Object { $_ -ne "" }
+    Write-Host "  Target mailboxes source:"
+    Write-Host "  1 - Enter manually (semicolon-separated)"
+    Write-Host "  2 - Load from CSV (clean or raw CIRT format)"
+    Write-Host ""
+
+    $mailboxes = @()
+
+    switch (Read-Host "  Select option") {
+
+        "1" {
+            # Manual entry
+            $raw       = Read-Host "  Target mailboxes"
+            $mailboxes = $raw -split ";" |
+                ForEach-Object { $_.Trim().ToLower() } |
+                Where-Object { $_ -match "^[\w\.\-\+]+@[\w\.\-]+\.[a-z]{2,}$" }
+        }
+
+        "2" {
+            # CSV — accepts any format, regex extracts valid emails
+            if (-not (Test-Path $script:RecipientsCSV)) {
+                Write-Host "  CSV not found at configured path:" -ForegroundColor Red
+                Write-Host "  $script:RecipientsCSV" -ForegroundColor DarkGray
+                Write-Host "  Check `$RecipientsCSV in the config section." -ForegroundColor Yellow
+                Start-Sleep 3
+                return
+            }
+
+            $rawContent = Get-Content $script:RecipientsCSV -Raw
+
+            if ([string]::IsNullOrWhiteSpace($rawContent)) {
+                Write-Host "  CSV file is empty." -ForegroundColor Red
+                Start-Sleep 2
+                return
+            }
+
+            # Read raw content — no assumptions about structure or headers
+            $mailboxes = [regex]::Matches($rawContent, "[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}") |
+                ForEach-Object { $_.Value.ToLower() } |
+                Sort-Object -Unique
+        }
+
+        default {
+            Write-Host "  Invalid option." -ForegroundColor Yellow
+            Start-Sleep 2
+            return
+        }
+    }
 
     $mailboxes = @($mailboxes)
 
     if ($mailboxes.Count -eq 0) {
-        Write-Error "No valid target mailboxes provided."
+        Write-Host "  No valid mailboxes found." -ForegroundColor Red
+        Start-Sleep 2
+        return
+    }
+
+    Write-Host ""
+    Write-Host "  $($mailboxes.Count) mailbox(es) loaded." -ForegroundColor Green
+    Write-Host ""
+
+    # ---------------------------
+    # Validate mailboxes against Exchange (RunspacePool for PS5 compatibility)
+    # ---------------------------
+    Write-Host "  Validating mailboxes against Exchange..." -ForegroundColor Gray
+    Write-Host ""
+
+    $validMailboxes = [System.Collections.Generic.List[string]]::new()
+    $total          = $mailboxes.Count
+    $completed      = 0
+
+    $pool = [RunspaceFactory]::CreateRunspacePool(1, 20)
+    $pool.Open()
+
+    $jobs = @()
+
+    foreach ($mbx in $mailboxes) {
+        $ps = [PowerShell]::Create()
+        $ps.RunspacePool = $pool
+        [void]$ps.AddScript({
+            param($identity)
+            Get-EXOMailbox -Identity $identity -ErrorAction SilentlyContinue
+        }).AddArgument($mbx)
+
+        $jobs += [PSCustomObject]@{
+            Mailbox   = $mbx
+            PS        = $ps
+            Handle    = $ps.BeginInvoke()
+        }
+    }
+
+    foreach ($job in $jobs) {
+        $result = $job.PS.EndInvoke($job.Handle)
+        if ($result) {
+            $validMailboxes.Add($job.Mailbox)
+        }
+        $job.PS.Dispose()
+        $completed++
+        Write-Host "`r  Progress: $completed / $total   " -NoNewline -ForegroundColor DarkGray
+    }
+
+    $pool.Close()
+    $pool.Dispose()
+
+    Write-Host ""
+    $mailboxes    = @($validMailboxes)
+    $invalidCount = $total - $mailboxes.Count
+
+    Write-Host "  Valid   : $($mailboxes.Count)" -ForegroundColor Green
+    if ($invalidCount -gt 0) {
+        Write-Host "  Invalid : $invalidCount (skipped)" -ForegroundColor Yellow
+    }
+    Write-Host ""
+
+    if ($mailboxes.Count -eq 0) {
+        Write-Host "  No valid mailboxes found. Aborting." -ForegroundColor Red
+        Read-Host "  Press Enter to continue"
         return
     }
 
@@ -188,16 +311,31 @@ function Invoke-MailDiscovery {
     Write-Host "  Generated search name: $name" -ForegroundColor Green
 
     # ---------------------------
-    # Create & run search 
+    # Create & run search
     # ---------------------------
     $params = @{
         Name              = $name
         ExchangeLocation  = $mailboxes
         ContentMatchQuery = $query
     }
-    New-ComplianceSearch @params
 
-    Start-ComplianceSearch -Identity $name
+    $createError = $null
+    New-ComplianceSearch @params -ErrorVariable createError -ErrorAction SilentlyContinue | Out-Null
+
+    if ($createError) {
+        $errMsg = $createError[0].ToString()
+        Write-Host ""
+        if ($errMsg -like "*cannot be found*") {
+            Write-Host "  One or more mailboxes could not be found in the tenant." -ForegroundColor Yellow
+            Write-Host "  Clean up the recipients list and try again." -ForegroundColor Yellow
+        } else {
+            Write-Host "  Error creating search: $errMsg" -ForegroundColor Red
+        }
+        Read-Host "  Press Enter to continue"
+        return
+    }
+
+    Start-ComplianceSearch -Identity $name | Out-Null
 
     do {
         Start-Sleep 10
@@ -207,7 +345,6 @@ function Invoke-MailDiscovery {
     while ($status.Status -in @("Starting","InProgress"))
 
     Write-Host ""
-
     # ---------------------------
     # Context
     # ---------------------------
